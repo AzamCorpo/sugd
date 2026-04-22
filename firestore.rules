@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} { 
+      allow read, write: if false; 
+    }
+
+    // Helpers
+    function isValidId(id) { 
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    // FIX: removed email_verified — Google popup & anonymous don't guarantee it immediately
+    function isVerified() { return isSignedIn(); }
+    function isAdmin() { 
+      return isSignedIn() && (
+        request.auth.token.email == 'azamashrapov2705@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true)
+      );
+    }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+
+    // FIX: removed strict createdAt == request.time (JS Date vs serverTimestamp mismatch)
+    function isValidUser(data, isCreate) {
+      return data.keys().hasAll(['username', 'email', 'createdAt', 'isAdmin']) 
+          && data.username is string && data.username.size() >= 3 && data.username.size() <= 20
+          && data.email is string && data.email.size() <= 100
+          && data.isAdmin is bool
+          && (isCreate ? data.isAdmin == false : true);
+    }
+
+    function isValidUserUpdate(data) {
+      return (!('username' in data) || (data.username is string && data.username.size() >= 3 && data.username.size() <= 20))
+          && (!('email' in data) || (data.email is string && data.email.size() <= 100))
+          && (!('isAdmin' in data) || data.isAdmin is bool);
+    }
+
+    function isValidUsernameRegistry(data, userId) {
+      return data.keys().hasAll(['userId']) 
+          && data.userId is string 
+          && data.userId.size() <= 128
+          && data.userId == userId;
+    }
+
+    match /users/{userId} {
+      allow read: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      
+      // FIX: removed existsAfter atomicity check (causes issues) and email_verified requirement
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUser(incoming(), true)
+        && (incoming().isAdmin == false || request.auth.token.email == 'azamashrapov2705@gmail.com');
+      
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && isValidUserUpdate(incoming())
+        && (isAdmin() || isOwner(userId));
+        
+      allow delete: if isAdmin();
+
+      // Allow users to read/write their own chats subcollection
+      match /data/{docId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    match /usernames/{usernameId} {
+      allow get: if isValidId(usernameId) && isSignedIn();
+      allow list: if false;
+
+      // FIX: removed existsAfter constraint
+      allow create: if isSignedIn()
+        && isValidId(usernameId)
+        && isValidUsernameRegistry(incoming(), request.auth.uid);
+
+      allow delete: if isSignedIn() && isValidId(usernameId) && (isAdmin() || isOwner(existing().userId));
+    }
+  }
+}
